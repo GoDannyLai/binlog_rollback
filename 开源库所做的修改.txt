@@ -1,0 +1,131 @@
+binlog_inspector所使用的两个开源库所做的改动
+
+
+1）增加两个可导出的函数ParseHeader与ParseEvent
+github.com\siddontang\go-mysql\replication\parser.go
+
+// added by danny
+func (p *BinlogParser) ParseHeader(data []byte) (*EventHeader, error) {
+	return p.parseHeader(data)
+}
+
+func (p *BinlogParser) parseHeader(data []byte) (*EventHeader, error) {
+	h := new(EventHeader)
+	err := h.Decode(data)
+	if err != nil {
+		return nil, err
+	}
+
+	return h, nil
+}
+
+// added by danny
+func (p *BinlogParser) ParseEvent(h *EventHeader, data []byte, rawData []byte) (Event, error) {
+	return p.parseEvent(h, data, rawData)
+}
+
+func (p *BinlogParser) parseEvent(h *EventHeader, data []byte, rawData []byte) (Event, error) {
+	var e Event
+    
+    
+
+2）修改让database名与table名可选是否加在前缀
+
+
+github.com\dropbox\godropbox\database\sqlbuilder\column.go
+func (c *baseColumn) SerializeSqlForColumnList(out *bytes.Buffer) error {
+	// danny modified. we don't need prefixing table name
+	/*
+		if c.table != "" {
+			_ = out.WriteByte('`')
+			_, _ = out.WriteString(c.table)
+			_, _ = out.WriteString("`.")
+		}
+	*/
+	_, _ = out.WriteString("`")
+	_, _ = out.WriteString(c.name)
+	_ = out.WriteByte('`')
+	return nil
+}
+
+github.com\dropbox\godropbox\database\sqlbuilder\statement.go：
+
+    func (s *insertStatementImpl) String(database string) (sql string, err error) {
+        // danny modified. if database empty, not validate it
+        if database != "" && !validIdentifierName(database) {
+            return "", errors.New("Invalid database name specified")
+        }
+
+        buf := new(bytes.Buffer)
+        _, _ = buf.WriteString("INSERT ")
+        if s.ignore {
+            _, _ = buf.WriteString("IGNORE ")
+        }
+        
+    func (u *updateStatementImpl) String(database string) (sql string, err error) {
+        // danny modify. we need to optionally set database name
+        if database != "" && !validIdentifierName(database) {
+            return "", errors.New("Invalid database name specified")
+        }
+
+        buf := new(bytes.Buffer)
+        _, _ = buf.WriteString("UPDATE ")
+        
+        
+    func (d *deleteStatementImpl) String(database string) (sql string, err error) {
+        // danny modify. we need to optionally set database name
+        if database != "" && !validIdentifierName(database) {
+            return "", errors.New("Invalid database name specified")
+        }
+
+        buf := new(bytes.Buffer)
+        _, _ = buf.WriteString("DELETE FROM ")
+        
+D:\danny\src\go\src\binlog_inspector\vendor\github.com\dropbox\godropbox\database\sqlbuilder\table.go：
+    
+    func (t *Table) SerializeSql(database string, out *bytes.Buffer) error {
+        //danny modified. if database empty, not write
+        if database != "" {
+            _, _ = out.WriteString("`")
+            _, _ = out.WriteString(database)
+            _, _ = out.WriteString("`.")
+        }
+        _, _ = out.WriteString("`")
+        _, _ = out.WriteString(t.Name())
+
+D:\danny\src\go\src\binlog_inspector\vendor\github.com\dropbox\godropbox\database\sqltypes\sqltypes.go：
+    
+    func BuildValue(goval interface{}) (v Value, err error) {
+	switch bindVal := goval.(type) {
+	case nil:
+		// no op
+	case bool:
+		val := 0
+		if bindVal {
+			val = 1
+		}
+		v = Value{Numeric(strconv.AppendInt(nil, int64(val), 10))}
+	//danny added
+	case int8:
+		v = Value{Numeric(strconv.AppendInt(nil, int64(bindVal), 10))}
+	//danny added
+	case int16:
+		v = Value{Numeric(strconv.AppendInt(nil, int64(bindVal), 10))}
+	case int:
+		v = Value{Numeric(strconv.AppendInt(nil, int64(bindVal), 10))}
+	case int32:
+		v = Value{Numeric(strconv.AppendInt(nil, int64(bindVal), 10))}
+	case int64:
+		v = Value{Numeric(strconv.AppendInt(nil, int64(bindVal), 10))}
+	case uint:
+		v = Value{Numeric(strconv.AppendUint(nil, uint64(bindVal), 10))}
+	case uint8:
+		v = Value{Numeric(strconv.AppendUint(nil, uint64(bindVal), 10))}
+	case uint32:
+		v = Value{Numeric(strconv.AppendUint(nil, uint64(bindVal), 10))}
+	case uint64:
+		v = Value{Numeric(strconv.AppendUint(nil, uint64(bindVal), 10))}
+	//danny added
+	case float32:
+		v = Value{Fractional(strconv.AppendFloat(nil, float64(bindVal), 'f', -1, 64))}
+	case float64:
