@@ -191,7 +191,7 @@ func (this BinFileParser) MyParseReader(cfg *ConfCmd, r io.Reader, evChan chan M
 		} else if chRe == C_reFileEnd {
 			return C_reFileEnd, nil
 		}
-		if h.EventType == replication.ROWS_QUERY_EVENT {
+		if cfg.IfWriteOrgSql && h.EventType == replication.ROWS_QUERY_EVENT {
 			orgSqlEvent = e.(*replication.RowsQueryEvent)
 			orgSqlChan <- OrgSqlPrint{Binlog: *binlog, DateTime: h.Timestamp,
 				StartPos: h.LogPos - h.EventSize, StopPos: h.LogPos, QuerySql: string(orgSqlEvent.Query)}
