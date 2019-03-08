@@ -259,6 +259,10 @@ func ProcessBinEventStats(statFH *os.File, ddlFH *os.File, biglongFH *os.File, c
 		lastBinlog = st.Binlog
 
 	}
+	//print stats
+	for _, oneSt := range statsPrintArr {
+		statFH.WriteString(GetStatsPrintContentLine(oneSt))
+	}
 	gLogger.WriteToLogByFieldsNormalOnlyMsg("exit thread to analyze statistics from binlog", logging.INFO)
 
 }
