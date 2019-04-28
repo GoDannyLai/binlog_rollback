@@ -222,7 +222,7 @@ func GenForwardRollbackSqlFromBinEvent(i uint, cfg *ConfCmd, evChan chan MyBinEv
 		err error
 		//var currentIdx uint64
 		tbInfo             *TblInfoJson
-		db, tb             string
+		db, tb, fulltb     string
 		allColNames        []FieldInfo
 		colsDef            []SQL.NonAliasColumn
 		colsTypeName       []string
@@ -235,146 +235,168 @@ func GenForwardRollbackSqlFromBinEvent(i uint, cfg *ConfCmd, evChan chan MyBinEv
 		ifIgnorePrimary    bool = cfg.IgnorePrimaryKeyForInsert
 		currentSqlForPrint ForwardRollbackSqlOfPrint
 		posStr             string
+		//printStatementSql  bool = false
 	)
 	gLogger.WriteToLogByFieldsNormalOnlyMsg(fmt.Sprintf("start thread %d to generate redo/rollback sql", i), logging.INFO)
 	if cfg.WorkType == "rollback" {
 		ifRollback = true
 	}
+	/*
+		if cfg.ParseStatementSql && cfg.WorkType == "2sql" {
+			printStatementSql = true
+		}
+	*/
 
 	for ev := range evChan {
-		db = string(ev.BinEvent.Table.Schema)
-		tb = string(ev.BinEvent.Table.Table)
 		posStr = GetPosStr(ev.MyPos.Name, ev.StartPos, ev.MyPos.Pos)
-		tbInfo, err = G_TablesColumnsInfo.GetTableInfoJsonOfBinPos(db, tb, ev.MyPos.Name, ev.StartPos, ev.MyPos.Pos)
-		if err != nil {
-			gLogger.WriteToLogByFieldsErrorExtramsgExit(err, fmt.Sprintf("error to found %s table structure for event %s",
-				GetAbsTableName(db, tb), posStr), logging.ERROR, ehand.ERR_BINLOG_EVENT)
-			continue
-		}
-		if tbInfo == nil {
-			gLogger.WriteToLogByFieldsExitMsgNoErr(fmt.Sprintf("no suitable table struct found for %s for event %s",
-				GetAbsTableName(db, tb), posStr), logging.ERROR, ehand.ERR_BINLOG_EVENT)
-		}
-		colCnt = len(ev.BinEvent.Rows[0])
-		allColNames = GetAllFieldNamesWithDroppedFields(colCnt, tbInfo.Columns)
-		colsDef, colsTypeName = GetSqlFieldsEXpressions(colCnt, allColNames, ev.BinEvent.Table)
-		colsTypeNameFromMysql := make([]string, len(colsTypeName))
-		if len(colsTypeName) > len(tbInfo.Columns) {
-			gLogger.WriteToLogByFieldsExitMsgNoErr(fmt.Sprintf("column count %d in binlog > in table structure %d, usually means DDL in the middle, pls generate a suitable table structure conf %s\ntable=%s\ntable structure:\n\t%s\nrow values:\n\t%s",
-				len(colsTypeName), len(tbInfo.Columns), cfg.ReadTblDefJsonFile, GetAbsTableName(db, tb), spew.Sdump(tbInfo.Columns), spew.Sdump(ev.BinEvent.Rows[0])),
-				logging.ERROR, ehand.ERR_ERROR)
-		}
-
-		// convert datetime/timestamp type to string
-		for ci, colType := range colsTypeName {
-			colsTypeNameFromMysql[ci] = tbInfo.Columns[ci].FieldType
-			// no need to do this because we donnot parse time/datetime column into go time structure
+		if !ev.IfRowsEvent {
 			/*
-				if sliceKits.ContainsString(G_Time_Column_Types, colType) {
-					for ri, _ := range ev.BinEvent.Rows {
-						if ev.BinEvent.Rows[ri][ci] == nil {
-							continue
-						}
+				//only target query can be here, no need to double check
+				if !printStatementSql || ev.QuerySql == nil || ev.QuerySql.IsDml() {
+					continue
+				}
+			*/
+			currentSqlForPrint = ForwardRollbackSqlOfPrint{sqls: []string{ev.OrgSql},
+				sqlInfo: ExtraSqlInfoOfPrint{schema: ev.QuerySql.Tables[0].Database, table: ev.QuerySql.Tables[0].Table,
+					binlog: ev.MyPos.Name, startpos: ev.StartPos, endpos: ev.MyPos.Pos,
+					datetime: GetDatetimeStr(int64(ev.Timestamp), int64(0), constvar.DATETIME_FORMAT_NOSPACE),
+					trxIndex: ev.TrxIndex, trxStatus: ev.TrxStatus}}
 
-						//fmt.Println(ev.BinEvent.Rows[ri][0], ev.BinEvent.Rows[ri][ci])
-						tv, convertOk := ev.BinEvent.Rows[ri][ci].(time.Time)
-						if !convertOk {
-							//spew.Dump(ev.BinEvent.Rows[ri][ci])
-							tStr, tStrOk := ev.BinEvent.Rows[ri][ci].(string)
+		} else {
+			db = string(ev.BinEvent.Table.Schema)
+			tb = string(ev.BinEvent.Table.Table)
+			fulltb = GetAbsTableName(db, tb)
+			tbInfo, err = G_TablesColumnsInfo.GetTableInfoJsonOfBinPos(db, tb, ev.MyPos.Name, ev.StartPos, ev.MyPos.Pos)
+			if err != nil {
+				gLogger.WriteToLogByFieldsErrorExtramsgExit(err, fmt.Sprintf("error to found %s table structure for event %s",
+					fulltb, posStr), logging.ERROR, ehand.ERR_BINLOG_EVENT)
+				continue
+			}
+			if tbInfo == nil {
+				gLogger.WriteToLogByFieldsExitMsgNoErr(fmt.Sprintf("no suitable table struct found for %s for event %s",
+					fulltb, posStr), logging.ERROR, ehand.ERR_BINLOG_EVENT)
+			}
+			colCnt = len(ev.BinEvent.Rows[0])
+			allColNames = GetAllFieldNamesWithDroppedFields(colCnt, tbInfo.Columns)
+			colsDef, colsTypeName = GetSqlFieldsEXpressions(colCnt, allColNames, ev.BinEvent.Table)
+			colsTypeNameFromMysql := make([]string, len(colsTypeName))
+			if len(colsTypeName) > len(tbInfo.Columns) {
+				gLogger.WriteToLogByFieldsExitMsgNoErr(fmt.Sprintf("column count %d in binlog > in table structure %d, usually means DDL in the middle, pls generate a suitable table structure conf %s\ntable=%s\nbinlog=%s\ntable structure:\n\t%s\nrow values:\n\t%s",
+					len(colsTypeName), len(tbInfo.Columns), cfg.ReadTblDefJsonFile, fulltb, ev.MyPos.String(), spew.Sdump(tbInfo.Columns), spew.Sdump(ev.BinEvent.Rows[0])),
+					logging.ERROR, ehand.ERR_ERROR)
+			}
 
-							if tStrOk {
-								tStrArr := strings.Split(tStr, ".")
-								if tStrArr[0] == constvar.DATETIME_ZERO_NO_MS {
+			// convert datetime/timestamp type to string
+			for ci, colType := range colsTypeName {
+				colsTypeNameFromMysql[ci] = tbInfo.Columns[ci].FieldType
+				// no need to do this because we donnot parse time/datetime column into go time structure
+				/*
+					if sliceKits.ContainsString(G_Time_Column_Types, colType) {
+						for ri, _ := range ev.BinEvent.Rows {
+							if ev.BinEvent.Rows[ri][ci] == nil {
+								continue
+							}
+
+							//fmt.Println(ev.BinEvent.Rows[ri][0], ev.BinEvent.Rows[ri][ci])
+							tv, convertOk := ev.BinEvent.Rows[ri][ci].(time.Time)
+							if !convertOk {
+								//spew.Dump(ev.BinEvent.Rows[ri][ci])
+								tStr, tStrOk := ev.BinEvent.Rows[ri][ci].(string)
+
+								if tStrOk {
+									tStrArr := strings.Split(tStr, ".")
+									if tStrArr[0] == constvar.DATETIME_ZERO_NO_MS {
+										ev.BinEvent.Rows[ri][ci] = constvar.DATETIME_ZERO
+									} else {
+										gLogger.WriteToLogByFieldsExitMsgNoErr(fmt.Sprintf("fail to convert %s.%s %v to time type %s, convert to string type OK, but value of it is not %s nor %s",
+											GetAbsTableName(db, tb), allColNames[ci].FieldName, ev.BinEvent.Rows[ri][ci], posStr,
+											constvar.DATETIME_ZERO, constvar.DATETIME_ZERO_NO_MS), logging.ERROR, ehand.ERR_ERROR)
+									}
+								} else {
+									gLogger.WriteToLogByFieldsExitMsgNoErr(fmt.Sprintf("fail to convert %s.%s %v to time type nor string type %s",
+										GetAbsTableName(db, tb), allColNames[ci].FieldName, ev.BinEvent.Rows[ri][ci],
+										posStr), logging.ERROR, ehand.ERR_ERROR)
+								}
+							} else {
+
+								if tv.IsZero() || tv.Unix() == 0 {
+									//fmt.Println("zero datetime")
 									ev.BinEvent.Rows[ri][ci] = constvar.DATETIME_ZERO
 								} else {
-									gLogger.WriteToLogByFieldsExitMsgNoErr(fmt.Sprintf("fail to convert %s.%s %v to time type %s, convert to string type OK, but value of it is not %s nor %s",
-										GetAbsTableName(db, tb), allColNames[ci].FieldName, ev.BinEvent.Rows[ri][ci], posStr,
-										constvar.DATETIME_ZERO, constvar.DATETIME_ZERO_NO_MS), logging.ERROR, ehand.ERR_ERROR)
+									tvStr := tv.Format(constvar.DATETIME_FORMAT_FRACTION)
+									if tvStr == constvar.DATETIME_ZERO_UNEXPECTED {
+										tvStr = constvar.DATETIME_ZERO
+									}
+									ev.BinEvent.Rows[ri][ci] = tvStr
 								}
-							} else {
-								gLogger.WriteToLogByFieldsExitMsgNoErr(fmt.Sprintf("fail to convert %s.%s %v to time type nor string type %s",
-									GetAbsTableName(db, tb), allColNames[ci].FieldName, ev.BinEvent.Rows[ri][ci],
-									posStr), logging.ERROR, ehand.ERR_ERROR)
+
 							}
-						} else {
+						}
+					} else*/
+				if colType == "blob" {
+					// text is stored as blob
+					if strings.Contains(strings.ToLower(tbInfo.Columns[ci].FieldType), "text") {
+						for ri, _ := range ev.BinEvent.Rows {
+							if ev.BinEvent.Rows[ri][ci] == nil {
+								continue
+							}
+							txtStr, coOk := ev.BinEvent.Rows[ri][ci].([]byte)
+							if !coOk {
+								gLogger.WriteToLogByFieldsExitMsgNoErr(fmt.Sprintf("fail to convert %s.%s %v to []byte type %s",
+									fulltb, allColNames[ci].FieldName,
+									ev.BinEvent.Rows[ri][ci], posStr), logging.ERROR, ehand.ERR_ERROR)
 
-							if tv.IsZero() || tv.Unix() == 0 {
-								//fmt.Println("zero datetime")
-								ev.BinEvent.Rows[ri][ci] = constvar.DATETIME_ZERO
 							} else {
-								tvStr := tv.Format(constvar.DATETIME_FORMAT_FRACTION)
-								if tvStr == constvar.DATETIME_ZERO_UNEXPECTED {
-									tvStr = constvar.DATETIME_ZERO
-								}
-								ev.BinEvent.Rows[ri][ci] = tvStr
+								ev.BinEvent.Rows[ri][ci] = string(txtStr)
 							}
 
 						}
-					}
-				} else*/
-			if colType == "blob" {
-				// text is stored as blob
-				if strings.Contains(strings.ToLower(tbInfo.Columns[ci].FieldType), "text") {
-					for ri, _ := range ev.BinEvent.Rows {
-						if ev.BinEvent.Rows[ri][ci] == nil {
-							continue
-						}
-						txtStr, coOk := ev.BinEvent.Rows[ri][ci].([]byte)
-						if !coOk {
-							gLogger.WriteToLogByFieldsExitMsgNoErr(fmt.Sprintf("fail to convert %s.%s %v to []byte type %s",
-								GetAbsTableName(db, tb), allColNames[ci].FieldName,
-								ev.BinEvent.Rows[ri][ci], posStr), logging.ERROR, ehand.ERR_ERROR)
-
-						} else {
-							ev.BinEvent.Rows[ri][ci] = string(txtStr)
-						}
-
 					}
 				}
 			}
-		}
-		uniqueKey = tbInfo.GetOneUniqueKey(cfg.UseUniqueKeyFirst)
-		if len(uniqueKey) > 0 {
-			uniqueKeyIdx = GetColIndexFromKey(uniqueKey, allColNames)
-		} else {
-			uniqueKeyIdx = []int{}
-		}
-
-		if len(tbInfo.PrimaryKey) > 0 {
-			primaryKeyIdx = GetColIndexFromKey(tbInfo.PrimaryKey, allColNames)
-		} else {
-			primaryKeyIdx = []int{}
-			ifIgnorePrimary = false
-		}
-
-		if ev.SqlType == "insert" {
-			if ifRollback {
-				sqlArr = GenDeleteSqlsForOneRowsEventRollbackInsert(posStr, ev.BinEvent, colsDef, uniqueKeyIdx, cfg.FullColumns, cfg.SqlTblPrefixDb)
+			uniqueKey = tbInfo.GetOneUniqueKey(cfg.UseUniqueKeyFirst)
+			if len(uniqueKey) > 0 {
+				uniqueKeyIdx = GetColIndexFromKey(uniqueKey, allColNames)
 			} else {
-				sqlArr = GenInsertSqlsForOneRowsEvent(posStr, ev.BinEvent, colsDef, cfg.InsertRows, false, cfg.SqlTblPrefixDb, ifIgnorePrimary, primaryKeyIdx)
+				uniqueKeyIdx = []int{}
 			}
 
-		} else if ev.SqlType == "delete" {
-			if ifRollback {
-				sqlArr = GenInsertSqlsForOneRowsEventRollbackDelete(posStr, ev.BinEvent, colsDef, cfg.InsertRows, cfg.SqlTblPrefixDb)
+			if len(tbInfo.PrimaryKey) > 0 {
+				primaryKeyIdx = GetColIndexFromKey(tbInfo.PrimaryKey, allColNames)
 			} else {
-				sqlArr = GenDeleteSqlsForOneRowsEvent(posStr, ev.BinEvent, colsDef, uniqueKeyIdx, cfg.FullColumns, false, cfg.SqlTblPrefixDb)
+				primaryKeyIdx = []int{}
+				ifIgnorePrimary = false
 			}
-		} else if ev.SqlType == "update" {
-			if ifRollback {
-				sqlArr = GenUpdateSqlsForOneRowsEvent(posStr, colsTypeNameFromMysql, colsTypeName, ev.BinEvent, colsDef, uniqueKeyIdx, cfg.FullColumns, true, cfg.SqlTblPrefixDb)
+
+			if ev.SqlType == "insert" {
+				if ifRollback {
+					sqlArr = GenDeleteSqlsForOneRowsEventRollbackInsert(posStr, ev.BinEvent, colsDef, uniqueKeyIdx, cfg.FullColumns, cfg.SqlTblPrefixDb)
+				} else {
+					sqlArr = GenInsertSqlsForOneRowsEvent(posStr, ev.BinEvent, colsDef, cfg.InsertRows, false, cfg.SqlTblPrefixDb, ifIgnorePrimary, primaryKeyIdx)
+				}
+
+			} else if ev.SqlType == "delete" {
+				if ifRollback {
+					sqlArr = GenInsertSqlsForOneRowsEventRollbackDelete(posStr, ev.BinEvent, colsDef, cfg.InsertRows, cfg.SqlTblPrefixDb)
+				} else {
+					sqlArr = GenDeleteSqlsForOneRowsEvent(posStr, ev.BinEvent, colsDef, uniqueKeyIdx, cfg.FullColumns, false, cfg.SqlTblPrefixDb)
+				}
+			} else if ev.SqlType == "update" {
+				if ifRollback {
+					sqlArr = GenUpdateSqlsForOneRowsEvent(posStr, colsTypeNameFromMysql, colsTypeName, ev.BinEvent, colsDef, uniqueKeyIdx, cfg.FullColumns, true, cfg.SqlTblPrefixDb)
+				} else {
+					sqlArr = GenUpdateSqlsForOneRowsEvent(posStr, colsTypeNameFromMysql, colsTypeName, ev.BinEvent, colsDef, uniqueKeyIdx, cfg.FullColumns, false, cfg.SqlTblPrefixDb)
+				}
 			} else {
-				sqlArr = GenUpdateSqlsForOneRowsEvent(posStr, colsTypeNameFromMysql, colsTypeName, ev.BinEvent, colsDef, uniqueKeyIdx, cfg.FullColumns, false, cfg.SqlTblPrefixDb)
+				fmt.Println("unsupported query type %s to generate 2sql|rollback sql, it should one of insert|update|delete. %s", ev.SqlType, ev.MyPos.String())
+				continue
 			}
-		} else {
-			fmt.Println("unsupported query type %s to generate 2sql|rollback sql, it should one of insert|update|delete. %s", ev.SqlType, ev.MyPos.String())
-			continue
+			//fmt.Println(sqlArr)
+			currentSqlForPrint = ForwardRollbackSqlOfPrint{sqls: sqlArr,
+				sqlInfo: ExtraSqlInfoOfPrint{schema: db, table: tb, binlog: ev.MyPos.Name, startpos: ev.StartPos, endpos: ev.MyPos.Pos,
+					datetime: GetDatetimeStr(int64(ev.Timestamp), int64(0), constvar.DATETIME_FORMAT_NOSPACE),
+					trxIndex: ev.TrxIndex, trxStatus: ev.TrxStatus}}
 		}
-		//fmt.Println(sqlArr)
-		currentSqlForPrint = ForwardRollbackSqlOfPrint{sqls: sqlArr,
-			sqlInfo: ExtraSqlInfoOfPrint{schema: db, table: tb, binlog: ev.MyPos.Name, startpos: ev.StartPos, endpos: ev.MyPos.Pos,
-				datetime: GetDatetimeStr(int64(ev.Timestamp), int64(0), constvar.DATETIME_FORMAT_NOSPACE),
-				trxIndex: ev.TrxIndex, trxStatus: ev.TrxStatus}}
 
 		for {
 			//fmt.Println("in thread", i)

@@ -50,7 +50,7 @@ func (this BinFileParser) MyParseAllBinlogFiles(cfg *ConfCmd, evChan chan MyBinE
 		if result == C_reBreak {
 			break
 		} else if result == C_reFileEnd {
-			if !cfg.IfSetStopParsPoint {
+			if !cfg.IfSetStopParsPoint && !cfg.IfSetStopDateTime {
 				//just parse one binlog
 				break
 			}
@@ -183,7 +183,7 @@ func (this BinFileParser) MyParseReader(cfg *ConfCmd, r io.Reader, evChan chan M
 		}
 		//e.Dump(os.Stdout)
 		//can not advance this check, because we need to parse table map event or table may not found. Also we must seek ahead the read file position
-		chRe := CheckBinHeaderCondition(cfg, h, binlog)
+		chRe := CheckBinHeaderCondition(cfg, h, *binlog)
 		if chRe == C_reBreak {
 			return C_reBreak, nil
 		} else if chRe == C_reContinue {
@@ -224,16 +224,30 @@ func (this BinFileParser) MyParseReader(cfg *ConfCmd, r io.Reader, evChan chan M
 					trxStatus = C_trxCommit
 				} else if sqlLower == "rollback" {
 					trxStatus = C_trxRollback
+				} else if oneMyEvent.QuerySql != nil && oneMyEvent.QuerySql.IsDml() {
+					trxStatus = C_trxProcess
+					rowCnt = 1
 				}
 			} else {
 				trxStatus = C_trxProcess
 			}
 
 			if cfg.WorkType != "stats" && oneMyEvent.IfRowsEvent {
+				ifSendEvent := false
+				if oneMyEvent.IfRowsEvent {
+					tbKey := GetAbsTableName(string(oneMyEvent.BinEvent.Table.Schema),
+						string(oneMyEvent.BinEvent.Table.Table))
+					if _, ok := G_TablesColumnsInfo.tableInfos[tbKey]; ok {
+						ifSendEvent = true
+					} else {
+						gLogger.WriteToLogByFieldsNormalOnlyMsg(fmt.Sprintf("no table struct found for %s, it maybe dropped, skip it. RowsEvent position:%s",
+							tbKey, oneMyEvent.MyPos.String()), logging.ERROR)
+					}
+				} else if cfg.WorkType == "2sql" && cfg.ParseStatementSql && oneMyEvent.QuerySql != nil && oneMyEvent.QuerySql.IsDml() {
+					ifSendEvent = true
+				}
 
-				tbKey := GetAbsTableName(string(oneMyEvent.BinEvent.Table.Schema),
-					string(oneMyEvent.BinEvent.Table.Table))
-				if _, ok := G_TablesColumnsInfo.tableInfos[tbKey]; ok {
+				if ifSendEvent {
 					fileBinEventHandlingIndex++
 					oneMyEvent.EventIdx = fileBinEventHandlingIndex
 					oneMyEvent.SqlType = sqlType
@@ -241,16 +255,20 @@ func (this BinFileParser) MyParseReader(cfg *ConfCmd, r io.Reader, evChan chan M
 					oneMyEvent.TrxIndex = fileTrxIndex
 					oneMyEvent.TrxStatus = trxStatus
 					evChan <- *oneMyEvent
-				} /*else {
-					fmt.Printf("no table struct found for %s, it maybe dropped, skip it. RowsEvent position:%s", tbKey, oneMyEvent.MyPos.String())
-				}*/
+				}
 
 			}
 
 			if sqlType != "" {
 				if sqlType == "query" {
-					statChan <- BinEventStats{Timestamp: h.Timestamp, Binlog: *binlog, StartPos: h.LogPos - h.EventSize, StopPos: h.LogPos,
-						Database: db, Table: tb, QuerySql: sql, RowCnt: rowCnt, QueryType: sqlType}
+					if oneMyEvent.QuerySql != nil {
+						statChan <- BinEventStats{Timestamp: h.Timestamp, Binlog: *binlog, StartPos: h.LogPos - h.EventSize, StopPos: h.LogPos,
+							Database: oneMyEvent.QuerySql.GetDatabasesAll(","), Table: oneMyEvent.QuerySql.GetFullTablesAll(","), QuerySql: sql,
+							RowCnt: rowCnt, QueryType: sqlType, ParsedSqlInfo: oneMyEvent.QuerySql.Copy()}
+					} else {
+						statChan <- BinEventStats{Timestamp: h.Timestamp, Binlog: *binlog, StartPos: h.LogPos - h.EventSize, StopPos: h.LogPos,
+							Database: db, Table: tb, QuerySql: sql, RowCnt: rowCnt, QueryType: sqlType}
+					}
 				} else {
 					statChan <- BinEventStats{Timestamp: h.Timestamp, Binlog: *binlog, StartPos: tbMapPos, StopPos: h.LogPos,
 						Database: db, Table: tb, QuerySql: sql, RowCnt: rowCnt, QueryType: sqlType}

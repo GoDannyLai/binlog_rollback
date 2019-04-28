@@ -74,6 +74,13 @@ var (
 		where c.CONSTRAINT_TYPE in ('PRIMARY KEY', 'UNIQUE') and c.table_schema in (%s) and c.table_name in (%s)
 		order by k.table_schema asc, k.table_name asc, k.CONSTRAINT_NAME asc, k.ORDINAL_POSITION asc
 	`
+	primaryUniqueKeysSqlBatchSameDb string = `
+		select k.table_schema, k.table_name, k.CONSTRAINT_NAME, k.COLUMN_NAME, c.CONSTRAINT_TYPE, k.ORDINAL_POSITION
+		from information_schema.TABLE_CONSTRAINTS as c inner join information_schema.KEY_COLUMN_USAGE as k on
+		c.CONSTRAINT_NAME = k.CONSTRAINT_NAME and c.table_schema = k.table_schema and c.table_name=k.table_name
+		where c.CONSTRAINT_TYPE in ('PRIMARY KEY', 'UNIQUE') and c.table_schema ='%s' and c.table_name in (%s)
+		order by k.table_schema asc, k.table_name asc, k.CONSTRAINT_NAME asc, k.ORDINAL_POSITION asc
+	`
 	columnNamesTypesSql string = `
 		select COLUMN_NAME, DATA_TYPE from information_schema.columns
 		where table_schema=? and table_name=?
@@ -83,6 +90,11 @@ var (
 	columnNamesTypesSqlBatch string = `
 		select table_schema, table_name, COLUMN_NAME, DATA_TYPE, ORDINAL_POSITION from information_schema.columns
 		where table_schema in (%s) and table_name in (%s)
+		order by table_schema asc, table_name asc, ORDINAL_POSITION asc
+	`
+	columnNamesTypesSqlBatchSameDb string = `
+		select table_schema, table_name, COLUMN_NAME, DATA_TYPE, ORDINAL_POSITION from information_schema.columns
+		where table_schema ='%s' and table_name in (%s)
 		order by table_schema asc, table_name asc, ORDINAL_POSITION asc
 	`
 	KEY_NONE_POS     uint32 = 0
@@ -141,7 +153,8 @@ func GetAndMergeColumnStructFromJsonFileAndDb(cfg *ConfCmd, fromFile *TablesColu
 	if err != nil {
 		gLogger.WriteToLogByFieldsErrorExtramsgExit(err, "fail to connect to mysql", logging.ERROR, ehand.ERR_MYSQL_CONNECTION)
 	}
-	allTables := GetAllTableNames(SqlCon, cfg)
+	//allTables := GetAllTableNames(SqlCon, cfg)
+	allTables := GetAllTableNamesRegexp(SqlCon, cfg)
 
 	fromFile.GetAllTableFieldsFromDb(SqlCon, allTables, 50)
 	fromFile.GetAllTableKeysInfoFromDb(SqlCon, allTables, 50)
@@ -201,7 +214,8 @@ func (this *TablesColumnsInfo) GetAllTableFieldsFromDb(db *sql.DB, dbTbs map[str
 		dbTbFieldsInfo map[string]map[string][]FieldInfo = map[string]map[string][]FieldInfo{}
 	)
 	gLogger.WriteToLogByFieldsNormalOnlyMsg("geting table fields from mysql", logging.INFO)
-	querySqls = GetFieldOrKeyQuerySqls(columnNamesTypesSqlBatch, dbTbs, batchCnt)
+	//querySqls = GetFieldOrKeyQuerySqls(columnNamesTypesSqlBatch, dbTbs, batchCnt)
+	querySqls = GetFieldOrKeyQuerySqlsSameDb(columnNamesTypesSqlBatchSameDb, dbTbs, batchCnt)
 
 	for _, oneQuery := range querySqls {
 
@@ -262,7 +276,8 @@ func (this *TablesColumnsInfo) GetAllTableKeysInfoFromDb(db *sql.DB, dbTbs map[s
 		primaryKeys                           map[string]map[string]map[string]bool    = map[string]map[string]map[string]bool{}
 	)
 	gLogger.WriteToLogByFieldsNormalOnlyMsg("geting primary/unique keys from mysql", logging.INFO)
-	querySqls := GetFieldOrKeyQuerySqls(primaryUniqueKeysSqlBatch, dbTbs, batchCnt)
+	//querySqls := GetFieldOrKeyQuerySqls(primaryUniqueKeysSqlBatch, dbTbs, batchCnt)
+	querySqls := GetFieldOrKeyQuerySqlsSameDb(primaryUniqueKeysSqlBatchSameDb, dbTbs, batchCnt)
 	for _, oneQuery := range querySqls {
 
 		rows, err := db.Query(oneQuery)
@@ -442,6 +457,30 @@ func GetFieldOrKeyQuerySqls(sqlFmt string, dbTbs map[string][]string, batchCnt i
 	return querySqls
 }
 
+func GetFieldOrKeyQuerySqlsSameDb(sqlFmt string, dbTbs map[string][]string, batchCnt int) []string {
+	var (
+		querySqls []string
+		oneSql    string = ""
+		db        string
+		endIdx    int
+		sidx      int
+	)
+	for db = range dbTbs {
+		tbCnt := len(dbTbs[db])
+		for sidx = 0; sidx < tbCnt; sidx += batchCnt {
+			endIdx = sidx + batchCnt
+			if endIdx >= tbCnt {
+				endIdx = tbCnt
+			}
+			oneSql = fmt.Sprintf(sqlFmt, db, GetStrCommaSepFromStrSlice(dbTbs[db][sidx:endIdx]))
+			querySqls = append(querySqls, oneSql)
+		}
+
+	}
+
+	return querySqls
+}
+
 func GetStrCommaSepFromStrSlice(arr []string) string {
 	arrTmp := make([]string, len(arr))
 	for i, v := range arr {
@@ -450,6 +489,7 @@ func GetStrCommaSepFromStrSlice(arr []string) string {
 	return strings.Join(arrTmp, ",")
 }
 
+/*
 func GetAllTableNames(sqlCon *sql.DB, cfg *ConfCmd) map[string][]string {
 	var (
 		sqlStr      string   = "select table_schema, table_name from information_schema.tables where "
@@ -481,6 +521,44 @@ func GetAllTableNames(sqlCon *sql.DB, cfg *ConfCmd) map[string][]string {
 		err = rows.Scan(&schema, &table)
 		if err != nil {
 			gLogger.WriteToLogByFieldsErrorExtramsgExit(err, "fail to get query result: "+sqlStr, logging.ERROR, ehand.ERR_MYSQL_QUERY)
+		}
+		_, ok := dbTbs[schema]
+		if ok {
+			dbTbs[schema] = append(dbTbs[schema], table)
+
+		} else {
+			dbTbs[schema] = []string{table}
+		}
+	}
+	return dbTbs
+
+}
+*/
+
+func GetAllTableNamesRegexp(sqlCon *sql.DB, cfg *ConfCmd) map[string][]string {
+	var (
+		sqlStr string = "select table_schema, table_name from information_schema.tables where table_type='BASE TABLE' and table_schema not in ('information_schema', 'performance_schema')"
+
+		schema string
+		table  string
+		dbTbs  map[string][]string = map[string][]string{}
+	)
+	gLogger.WriteToLogByFieldsNormalOnlyMsg("geting target table names from mysql", logging.INFO)
+	rows, err := sqlCon.Query(sqlStr)
+	if rows != nil {
+		defer rows.Close()
+	}
+	if err != nil {
+		gLogger.WriteToLogByFieldsErrorExtramsgExit(err, "fail to query: "+sqlStr, logging.ERROR, ehand.ERR_MYSQL_QUERY)
+	}
+
+	for rows.Next() {
+		err = rows.Scan(&schema, &table)
+		if err != nil {
+			gLogger.WriteToLogByFieldsErrorExtramsgExit(err, "fail to get query result: "+sqlStr, logging.ERROR, ehand.ERR_MYSQL_QUERY)
+		}
+		if !cfg.IsTargetTable(schema, table) {
+			continue
 		}
 		_, ok := dbTbs[schema]
 		if ok {

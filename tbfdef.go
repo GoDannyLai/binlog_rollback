@@ -31,7 +31,7 @@ func GetTblDefFromDbAndMergeAndDump(cfg *ConfCmd) {
 		//fmt.Println("finish getting table struct from db:", time.Now())
 		//write table column def json
 		if len(G_TablesColumnsInfo.tableInfos) == 0 {
-			gLogger.WriteToLogByFieldsExitMsgNoErr(fmt.Sprintf("get no table difinition info from mysql, pls check user %s has privileges to read tables in infomation_schema!!!\nError Exits!!", cfg.User),
+			gLogger.WriteToLogByFieldsExitMsgNoErr(fmt.Sprintf("get no table difinition info from mysql. -dbs and -tbs should be in lower case, or pls check user %s has privileges to read tables in infomation_schema!!!\nError Exits!!", cfg.User),
 				logging.ERROR, ehand.ERR_MYSQL_QUERY)
 		} else {
 			gLogger.WriteToLogByFieldsNormalOnlyMsg("successfully get table structure from mysql", logging.INFO)

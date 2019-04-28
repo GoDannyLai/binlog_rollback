@@ -10,18 +10,23 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strings"
 	"sync"
 	"time"
 
+	"github.com/pingcap/parser"
+	_ "github.com/pingcap/tidb/types/parser_driver"
 	"github.com/siddontang/go-mysql/mysql"
 	"github.com/toolkits/file"
+	sliceKits "github.com/toolkits/slice"
 )
 
 const (
-	C_Version      = "binlog_rollback V2.00 By laijunshou@gmail.com\n"
+	C_Version      = "binlog_rollback V2.1 By laijunshou@gmail.com\n"
 	C_validOptMsg  = "valid options are: "
 	C_joinSepComma = ","
-	C_ddlRegexp    = `^\s*(alter|create|rename|truncate|drop)`
+	//C_ddlRegexp    = `^\s*(alter|create|rename|truncate|drop)`
+	C_ignoreParsedErrSql = "^create definer.+trigger"
 
 	C_unknownColPrefix   = "dropped_column_"
 	C_unknownColType     = "unknown_type"
@@ -44,6 +49,9 @@ var (
 	gLogger             *logging.MyLog = &logging.MyLog{}
 	gConfCmd            *ConfCmd       = &ConfCmd{}
 	gBinlogTimeLocation *time.Location
+	gSqlParser          *parser.Parser = parser.New()
+
+	gUseDatabase string = ""
 
 	gOptsValidMode      []string = []string{"repl", "file"}
 	gOptsValidWorkType  []string = []string{"tbldef", "stats", "2sql", "rollback"}
@@ -96,8 +104,12 @@ type ConfCmd struct {
 	Socket   string
 	ServerId uint
 
-	Databases    []string
-	Tables       []string
+	//Databases    []string
+	//Tables       []string
+	DatabaseRegs []*regexp.Regexp
+	ifHasDbReg   bool
+	TableRegs    []*regexp.Regexp
+	ifHasTbReg   bool
 	FilterSql    []string
 	FilterSqlLen int
 
@@ -150,7 +162,11 @@ type ConfCmd struct {
 	UseUniqueKeyFirst         bool
 	IgnorePrimaryKeyForInsert bool
 
-	DdlRegexp string
+	//DdlRegexp string
+	ParseStatementSql bool
+
+	IgnoreParsedErrForSql string // if parsed error, for sql match this regexp, only print error info, but not exits
+	IgnoreParsedErrRegexp *regexp.Regexp
 }
 
 func (this *ConfCmd) ParseCmdOptions() {
@@ -178,8 +194,8 @@ func (this *ConfCmd) ParseCmdOptions() {
 	flag.StringVar(&this.Socket, "S", "", "mysql socket file")
 	flag.UintVar(&this.ServerId, "mid", 3320, "works with -m=repl, this program replicates from master as slave to read binlogs. Must set this server id unique from other slaves, default 3320")
 
-	flag.StringVar(&dbs, "dbs", "", "only parse these databases, comma seperated, default all. Useless when -w=stats")
-	flag.StringVar(&tbs, "tbs", "", "only parse these tables, comma seperated, DONOT prefix with schema, default all. Useless when -w=stats")
+	flag.StringVar(&dbs, "dbs", "", "only parse database which match any of these regular expressions. The regular expression should be in lower case because database name is translated into lower case and then matched against it. \n\tMulti regular expressions is seperated by comma, default parse all databases. Useless when -w=stats")
+	flag.StringVar(&tbs, "tbs", "", "only parse table which match any of these regular expressions.The regular expression should be in lower case because database name is translated into lower case and then matched against it. \n\t Multi regular expressions is seperated by comma, default parse all tables. Useless when -w=stats")
 	flag.StringVar(&sqlTypes, "sql", "", StrSliceToString(gOptsValidFilterSql, C_joinSepComma, C_validOptMsg)+". only parse these types of sql, comma seperated, valid types are: insert, update, delete; default is all(insert,update,delete)")
 
 	flag.StringVar(&this.StartFile, "sbin", "", "binlog file to start reading")
@@ -217,7 +233,9 @@ func (this *ConfCmd) ParseCmdOptions() {
 
 	flag.BoolVar(&this.UseUniqueKeyFirst, "U", false, "prefer to use unique key instead of primary key to build where condition for delete/update sql")
 	flag.BoolVar(&this.IgnorePrimaryKeyForInsert, "I", false, "for insert statement when -wtype=2sql, ignore primary key")
-	flag.StringVar(&this.DdlRegexp, "de", C_ddlRegexp, "sql(lower case) matching this regular expression will be outputed into ddl_info.log")
+	//flag.StringVar(&this.DdlRegexp, "de", C_ddlRegexp, "sql(lower case) matching this regular expression will be outputed into ddl_info.log")
+	flag.BoolVar(&this.ParseStatementSql, "stsql", false, "when -w=2sql, also parse plain sql and write into result file even if binlog_format is not row. default false")
+	flag.StringVar(&this.IgnoreParsedErrForSql, "ies", C_ignoreParsedErrSql, "for sql which is error to parsed and matched by this regular expression, just print error info, skip it and continue parsing, otherwise stop parsing and exit.\n\tThe regular expression should be in lower case, because sql is translated into lower case and then matched against it.")
 
 	flag.Parse()
 	//flag.PrintDefaults()
@@ -289,12 +307,34 @@ func (this *ConfCmd) ParseCmdOptions() {
 		}
 	}
 
+	this.ifHasDbReg = false
 	if dbs != "" {
-		this.Databases = CommaSeparatedListToArray(dbs)
+		dbArr := CommaSeparatedListToArray(dbs)
+		for _, dbRegStr := range dbArr {
+			dbreg, err := regexp.Compile(dbRegStr)
+			if err != nil {
+				gLogger.WriteToLogByFieldsErrorExtramsgExit(err, fmt.Sprintf("%s is not a valid regular expression", dbRegStr), logging.ERROR, ehand.ERR_ERROR)
+			}
+			this.DatabaseRegs = append(this.DatabaseRegs, dbreg)
+		}
+		if len(this.DatabaseRegs) > 0 {
+			this.ifHasDbReg = true
+		}
 	}
 
+	this.ifHasTbReg = false
 	if tbs != "" {
-		this.Tables = CommaSeparatedListToArray(tbs)
+		tbArr := CommaSeparatedListToArray(tbs)
+		for _, tbRegStr := range tbArr {
+			tbReg, err := regexp.Compile(tbRegStr)
+			if err != nil {
+				gLogger.WriteToLogByFieldsErrorExtramsgExit(err, fmt.Sprintf("%s is not a valid regular expression", tbRegStr), logging.ERROR, ehand.ERR_ERROR)
+			}
+			this.TableRegs = append(this.TableRegs, tbReg)
+		}
+		if len(this.TableRegs) > 0 {
+			this.ifHasTbReg = true
+		}
 	}
 
 	if sqlTypes != "" {
@@ -339,10 +379,18 @@ func (this *ConfCmd) ParseCmdOptions() {
 		}
 	}
 
-	if this.DdlRegexp == "" {
-		this.DdlRegexp = C_ddlRegexp
+	/*
+		if this.DdlRegexp == "" {
+			this.DdlRegexp = C_ddlRegexp
+		}
+		gDdlRegexp = regexp.MustCompile(this.DdlRegexp)
+	*/
+	if this.IgnoreParsedErrForSql != "" {
+		this.IgnoreParsedErrRegexp, err = regexp.Compile(this.IgnoreParsedErrForSql)
+		if err != nil {
+			gLogger.WriteToLogByFieldsErrorExtramsgExit(err, "invalid regular expression: "+this.IgnoreParsedErrForSql, logging.ERROR, ehand.ERR_REG_COMPILE)
+		}
 	}
-	gDdlRegexp = regexp.MustCompile(this.DdlRegexp)
 
 	this.CheckCmdOptions()
 
@@ -364,6 +412,13 @@ func (this *ConfCmd) CheckCmdOptions() {
 		//check --password
 		this.CheckRequiredOption(this.Passwd, "-p must be set", true)
 
+	}
+
+	if this.StartFile != "" {
+		this.StartFile = filepath.Base(this.StartFile)
+	}
+	if this.StopFile != "" {
+		this.StopFile = filepath.Base(this.StopFile)
 	}
 
 	//check --start-binlog --start-pos --stop-binlog --stop-pos
@@ -521,4 +576,47 @@ func (this *ConfCmd) GetDefaultAndRangeValueMsg(opt string) string {
 		this.GetMaxValueOfRange(opt),
 		this.GetDefaultValueOfRange(opt),
 	)
+}
+
+func (this *ConfCmd) IsTargetTable(db, tb string) bool {
+	dbLower := strings.ToLower(db)
+	tbLower := strings.ToLower(tb)
+	if this.ifHasDbReg {
+		ifMatch := false
+		for _, oneReg := range this.DatabaseRegs {
+			if oneReg.MatchString(dbLower) {
+				ifMatch = true
+				break
+			}
+		}
+		if !ifMatch {
+			return false
+		}
+	}
+
+	if this.ifHasTbReg {
+		ifMatch := false
+		for _, oneReg := range this.TableRegs {
+			if oneReg.MatchString(tbLower) {
+				ifMatch = true
+				break
+			}
+		}
+		if !ifMatch {
+			return false
+		}
+	}
+	return true
+
+}
+
+func (this *ConfCmd) IsTargetDml(dml string) bool {
+	if this.FilterSqlLen < 1 {
+		return true
+	}
+	if sliceKits.ContainsString(this.FilterSql, dml) {
+		return true
+	} else {
+		return false
+	}
 }

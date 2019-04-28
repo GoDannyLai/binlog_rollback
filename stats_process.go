@@ -2,12 +2,14 @@ package main
 
 import (
 	"dannytools/constvar"
+	"dannytools/dsql"
 	"dannytools/ehand"
 	"dannytools/logging"
 	"fmt"
 	"os"
 	"path/filepath"
-	"regexp"
+
+	//"regexp"
 	"strings"
 	"sync"
 
@@ -19,7 +21,7 @@ const (
 )
 
 var (
-	gDdlRegexp *regexp.Regexp = regexp.MustCompile(C_ddlRegexp)
+	//gDdlRegexp *regexp.Regexp = regexp.MustCompile(C_ddlRegexp)
 
 	Stats_Result_Header_Column_names []string = []string{"binlog", "starttime", "stoptime",
 		"startpos", "stoppos", "inserts", "updates", "deletes", "database", "table"}
@@ -36,15 +38,16 @@ type OrgSqlPrint struct {
 }
 
 type BinEventStats struct {
-	Timestamp uint32
-	Binlog    string
-	StartPos  uint32
-	StopPos   uint32
-	Database  string
-	Table     string
-	QueryType string // query, insert, update, delete
-	RowCnt    uint32
-	QuerySql  string // for type=query
+	Timestamp     uint32
+	Binlog        string
+	StartPos      uint32
+	StopPos       uint32
+	Database      string
+	Table         string
+	QueryType     string // query, insert, update, delete
+	RowCnt        uint32
+	QuerySql      string        // for type=query
+	ParsedSqlInfo *dsql.SqlInfo // for ddl
 }
 
 type BinEventStatsPrint struct {
@@ -171,6 +174,8 @@ func ProcessBinEventStats(statFH *os.File, ddlFH *os.File, biglongFH *os.File, c
 		printInterval   uint32 = uint32(cfg.PrintInterval)
 		bigTrxRowsLimit uint32 = uint32(cfg.BigTrxRowLimit)
 		longTrxSecs     uint32 = uint32(cfg.LongTrxSeconds)
+		dbtbKeyes       []string
+		ddlSql          string
 	)
 	gLogger.WriteToLogByFieldsNormalOnlyMsg("start thread to analyze statistics from binlog", logging.INFO)
 	for st := range statChan {
@@ -191,6 +196,8 @@ func ProcessBinEventStats(statFH *os.File, ddlFH *os.File, biglongFH *os.File, c
 		if lastBinlog == "" {
 			lastBinlog = st.Binlog
 		}
+
+		dbtbKeyes = []string{}
 		if st.QueryType == "query" {
 			//fmt.Print(st.QuerySql)
 			querySql := strings.ToLower(st.QuerySql)
@@ -210,10 +217,26 @@ func ProcessBinEventStats(statFH *os.File, ddlFH *os.File, biglongFH *os.File, c
 					}
 				}
 
-			} else if gDdlRegexp.MatchString(querySql) {
-				// ddl
-				ddlInfoStr = GetDdlInfoContentLine(st.Binlog, st.StartPos, st.StopPos, st.Timestamp, st.QuerySql)
-				ddlFH.WriteString(ddlInfoStr)
+			} else if st.ParsedSqlInfo != nil {
+
+				if st.ParsedSqlInfo.IsDdl() {
+					//DDL
+					ddlSql = ""
+					if st.ParsedSqlInfo.UseDatabase != "" && !st.ParsedSqlInfo.IsDatabaseDDL() {
+						ddlSql = "use " + st.ParsedSqlInfo.UseDatabase + ";"
+					}
+					ddlSql += st.ParsedSqlInfo.SqlStr
+					ddlInfoStr = GetDdlInfoContentLine(st.Binlog, st.StartPos, st.StopPos, st.Timestamp, ddlSql)
+					ddlFH.WriteString(ddlInfoStr)
+
+				} else if st.ParsedSqlInfo.IsDml() {
+					//DML
+					for _, oneTb := range st.ParsedSqlInfo.Tables {
+						dbtbKeyes = append(dbtbKeyes, GetAbsTableName(oneTb.Database, oneTb.Table))
+					}
+					st.QueryType = st.ParsedSqlInfo.GetDmlName()
+				}
+
 			}
 		} else {
 			//big and long trx
@@ -227,32 +250,36 @@ func ProcessBinEventStats(statFH *os.File, ddlFH *os.File, biglongFH *os.File, c
 			if oneBigLong.StartTime == 0 {
 				oneBigLong.StartTime = st.Timestamp
 			}
+			dbtbKeyes = append(dbtbKeyes, dbtbKey)
 
+		}
+		for _, oneTbKey := range dbtbKeyes {
 			//stats
-			if _, ok := statsPrintArr[dbtbKey]; !ok {
-				statsPrintArr[dbtbKey] = &BinEventStatsPrint{Binlog: st.Binlog, StartTime: st.Timestamp, StartPos: st.StartPos,
+			if _, ok := statsPrintArr[oneTbKey]; !ok {
+				statsPrintArr[oneTbKey] = &BinEventStatsPrint{Binlog: st.Binlog, StartTime: st.Timestamp, StartPos: st.StartPos,
 					Database: st.Database, Table: st.Table, Inserts: 0, Updates: 0, Deletes: 0}
 			}
 			switch st.QueryType {
 			case "insert":
-				statsPrintArr[dbtbKey].Inserts += st.RowCnt
+				statsPrintArr[oneTbKey].Inserts += st.RowCnt
 			case "update":
-				statsPrintArr[dbtbKey].Updates += st.RowCnt
+				statsPrintArr[oneTbKey].Updates += st.RowCnt
 			case "delete":
-				statsPrintArr[dbtbKey].Deletes += st.RowCnt
+				statsPrintArr[oneTbKey].Deletes += st.RowCnt
 			}
-			statsPrintArr[dbtbKey].StopTime = st.Timestamp
-			statsPrintArr[dbtbKey].StopPos = st.StopPos
-			if st.Timestamp >= lastPrintTime {
+			statsPrintArr[oneTbKey].StopTime = st.Timestamp
+			statsPrintArr[oneTbKey].StopPos = st.StopPos
+		}
 
-				//print stats
-				for _, oneSt := range statsPrintArr {
-					statFH.WriteString(GetStatsPrintContentLine(oneSt))
-				}
-				//statFH.WriteString("\n")
-				statsPrintArr = map[string]*BinEventStatsPrint{}
-				lastPrintTime = st.Timestamp + printInterval
+		if st.Timestamp >= lastPrintTime {
+
+			//print stats
+			for _, oneSt := range statsPrintArr {
+				statFH.WriteString(GetStatsPrintContentLine(oneSt))
 			}
+			//statFH.WriteString("\n")
+			statsPrintArr = map[string]*BinEventStatsPrint{}
+			lastPrintTime = st.Timestamp + printInterval
 
 		}
 
