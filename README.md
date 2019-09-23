@@ -388,4 +388,4 @@
         *只生成DML报表:
             ./binlog_rollback -m file -w stats -M mysql -i 20 -b 100 -l 10 -o /home/apps/tmp mysql-bin.000556
 # 联系
-    已经在生产使用超过一年, 多次在线回滚过数据， 校对数据更新。有任何的bug或者使用反馈， 欢迎联系laijunshou@gmail.com.
+    已经在生产使用超过一年, 多次在线回滚过数据， 校对数据更新。有任何的bug或者使用反馈， 欢迎联系329264252@qq.com
